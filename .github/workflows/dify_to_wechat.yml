@@ -1,63 +1,53 @@
-# .github/workflows/dify_scheduled_report.yml
-
-name: Dify Scheduled Report to WeChat
-
-on:
-  # 1. 定时触发：在北京时间每天晚上 20:00 运行
-  # GitHub Actions 使用 UTC 时间，北京时间 (UTC+8) 20:00 等于 UTC 时间 12:00
-  schedule:
-    - cron: '0 12 * * *'
-
-  # 2. 保留手动触发，方便你随时测试
-  workflow_dispatch:
-
-jobs:
-  run_dify_and_notify:
-    runs-on: ubuntu-latest
-    # 增加一个超时设置，防止 Action 无限运行下去，比如最多运行10分钟
-    timeout-minutes: 10
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      # 核心步骤：调用 Dify 并获取结果 (异步轮询)
+      # 核心步骤：调用 Dify 并获取结果 (异步轮询) - 优化版
       - name: Call Dify Workflow Asynchronously and Poll for Result
         id: dify_call_async
         run: |
-          # --- 步骤 1: 触发工作流并获取 task_id ---
-          # 使用 "streaming" 模式，它会立即返回一个 task_id
-          echo "Triggering Dify workflow in streaming mode..."
-          trigger_response=$(curl -sS -X POST "${{ secrets.DIFY_WORKFLOW_URL }}" \
+          # --- 步骤 1: 触发工作流并获取 task_id (使用流式读取，防止启动超时) ---
+          echo "Triggering Dify workflow and waiting for task_id..."
+          
+          # 使用 curl -N (或 --no-buffer) 来处理流式响应，防止因 Dify 启动慢于 60s 而导致网关超时
+          # 使用 `timeout` 命令确保此步骤不会无限期挂起，例如最多等待 3 分钟来获取 task_id
+          task_id=""
+          timeout 180s curl -sS -N -X POST "${{ secrets.DIFY_WORKFLOW_URL }}" \
             -H "Authorization: Bearer ${{ secrets.DIFY_API_KEY }}" \
             -H "Content-Type: application/json" \
             -d '{
               "inputs": {},
               "response_mode": "streaming",
               "user": "github-actions-async-job"
-            }')
+            }' | while read -r line; do
+              # 我们只关心包含 task_id 的第一条 'workflow_started' 事件
+              if [[ $line == data:* ]]; then
+                # 提取 JSON 部分
+                json_data=$(echo "$line" | sed 's/^data: //')
+                
+                # 检查是否是 workflow_started 事件
+                event=$(echo "$json_data" | jq -r '.event')
+                if [[ "$event" == "workflow_started" ]]; then
+                  task_id=$(echo "$json_data" | jq -r '.task_id')
+                  echo "Successfully received task_id: $task_id"
+                  # 成功获取 task_id 后，杀掉仍在运行的 curl 进程并退出循环
+                  # 因为我们只需要 task_id，不需要后续的流式结果
+                  pkill -P $$ curl # pkill curl that is a child of the current shell process
+                  break
+                fi
+              fi
+            done
 
-          # 从返回的第一个事件中解析 task_id
-          # 流式响应由多行 `data: {...}` 组成，我们只取第一行
-          task_id=$(echo "$trigger_response" | grep '"event":"workflow_started"' | jq -r '.task_id')
-
+          # 检查是否成功获取 task_id
           if [ -z "$task_id" ]; then
-            echo "::error::Failed to get task_id from Dify. Response was:"
-            echo "$trigger_response"
+            echo "::error::Failed to get task_id from Dify stream after 180 seconds."
             exit 1
           fi
-          echo "Workflow started with task_id: $task_id"
 
-          # --- 步骤 2: 轮询任务状态 ---
-          # 构造查询状态的 URL
+          # --- 步骤 2: 轮询任务状态 (这部分逻辑保持不变) ---
           status_url="https://api.dify.ai/v1/tasks/${task_id}/result" # 如果是自部署，请修改域名
           
-          # 设置轮询参数
-          max_retries=55 # 最多轮询30次
-          sleep_interval=10 # 每次间隔10秒
+          max_retries=60 # 增加轮询次数，总时长 60 * 10s = 600s = 10分钟
+          sleep_interval=10
 
           for (( i=1; i<=max_retries; i++ )); do
-            echo "Polling attempt #$i..."
+            echo "Polling attempt #$i for task $task_id..."
             status_response=$(curl -sS -X GET "$status_url" \
               -H "Authorization: Bearer ${{ secrets.DIFY_API_KEY }}")
 
@@ -66,7 +56,6 @@ jobs:
 
             if [ "$status" == "succeeded" ]; then
               echo "Task succeeded!"
-              # --- 步骤 3: 提取最终结果 ---
               # !! 重要 !!: 同样需要根据你的输出变量名修改 '.outputs.text'
               final_result=$(echo "$status_response" | jq -r '.outputs.text')
               
@@ -74,27 +63,16 @@ jobs:
               echo "result<<EOF" >> $GITHUB_OUTPUT
               echo "$final_result" >> $GITHUB_OUTPUT
               echo "EOF" >> $GITHUB_OUTPUT
-              exit 0 # 成功退出脚本
+              exit 0
             
             elif [ "$status" == "failed" ] || [ "$status" == "stopped" ]; then
               echo "::error::Task failed or was stopped. Full response:"
               echo "$status_response"
-              exit 1 # 失败退出脚本
+              exit 1
             fi
 
-            # 如果任务仍在运行，则等待一段时间再查询
             sleep $sleep_interval
           done
 
-          # 如果循环结束任务仍未完成，则视为超时
           echo "::error::Polling timed out after $(($max_retries * $sleep_interval)) seconds."
           exit 1
-
-
-      # 将结果发送到 Server酱 (这一步无需修改)
-      - name: Send result to ServerChan
-        if: success()
-        run: |
-          curl -sS -X POST "https://sctapi.ftqq.com/${{ secrets.SERVERCHAN_KEY }}.send" \
-            --data-urlencode "title=📅 每日Dify任务报告 (异步)" \
-            --data-urlencode "desp=${{ steps.dify_call_async.outputs.result }}"
