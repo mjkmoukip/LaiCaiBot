@@ -14,47 +14,87 @@ on:
 jobs:
   run_dify_and_notify:
     runs-on: ubuntu-latest
+    # 增加一个超时设置，防止 Action 无限运行下去，比如最多运行10分钟
+    timeout-minutes: 10
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 核心步骤一：调用 Dify 工作流 API
-      - name: Call Dify Workflow API
-        id: dify_call # 为步骤设置 ID，方便后续引用其输出
+      # 核心步骤：调用 Dify 并获取结果 (异步轮询)
+      - name: Call Dify Workflow Asynchronously and Poll for Result
+        id: dify_call_async
         run: |
-          # 发送 POST 请求到 Dify API
-          # 因为工作流不需要输入，所以 "inputs" 是一个空对象 {}
-          response=$(curl -sS -X POST "${{ secrets.DIFY_WORKFLOW_URL }}" \
+          # --- 步骤 1: 触发工作流并获取 task_id ---
+          # 使用 "streaming" 模式，它会立即返回一个 task_id
+          echo "Triggering Dify workflow in streaming mode..."
+          trigger_response=$(curl -sS -X POST "${{ secrets.DIFY_WORKFLOW_URL }}" \
             -H "Authorization: Bearer ${{ secrets.DIFY_API_KEY }}" \
             -H "Content-Type: application/json" \
             -d '{
               "inputs": {},
-              "response_mode": "blocking",
-              "user": "github-actions-scheduled-job"
+              "response_mode": "streaming",
+              "user": "github-actions-async-job"
             }')
 
-          # 打印 Dify 返回的原始 JSON，这对于调试至关重要
-          echo "Dify Raw Response:"
-          echo "$response"
+          # 从返回的第一个事件中解析 task_id
+          # 流式响应由多行 `data: {...}` 组成，我们只取第一行
+          task_id=$(echo "$trigger_response" | grep '"event":"workflow_started"' | jq -r '.task_id')
 
-          # 使用 jq 解析 JSON，提取结果
-          # !! 重要 !!: 这个路径 '.data.outputs.text' 需要根据你的工作流实际输出来修改。
-          # 请查看上面打印的 "Dify Raw Response" 来确定正确的路径。
-          # 例如，如果你的输出变量叫 'result', 路径可能就是 '.data.outputs.result'
-          result=$(echo "$response" | jq -r '.data.outputs.text')
+          if [ -z "$task_id" ]; then
+            echo "::error::Failed to get task_id from Dify. Response was:"
+            echo "$trigger_response"
+            exit 1
+          fi
+          echo "Workflow started with task_id: $task_id"
 
-          # 将提取的结果设置为该步骤的输出变量，以便下一步使用
-          # 使用特殊格式来处理可能的多行文本
-          echo "result<<EOF" >> $GITHUB_OUTPUT
-          echo "$result" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+          # --- 步骤 2: 轮询任务状态 ---
+          # 构造查询状态的 URL
+          status_url="https://api.dify.ai/v1/tasks/${task_id}/result" # 如果是自部署，请修改域名
+          
+          # 设置轮询参数
+          max_retries=55 # 最多轮询30次
+          sleep_interval=10 # 每次间隔10秒
 
-      # 核心步骤二：将结果发送到 Server酱
+          for (( i=1; i<=max_retries; i++ )); do
+            echo "Polling attempt #$i..."
+            status_response=$(curl -sS -X GET "$status_url" \
+              -H "Authorization: Bearer ${{ secrets.DIFY_API_KEY }}")
+
+            status=$(echo "$status_response" | jq -r '.status')
+            echo "Current task status: $status"
+
+            if [ "$status" == "succeeded" ]; then
+              echo "Task succeeded!"
+              # --- 步骤 3: 提取最终结果 ---
+              # !! 重要 !!: 同样需要根据你的输出变量名修改 '.outputs.text'
+              final_result=$(echo "$status_response" | jq -r '.outputs.text')
+              
+              # 设置输出并退出循环
+              echo "result<<EOF" >> $GITHUB_OUTPUT
+              echo "$final_result" >> $GITHUB_OUTPUT
+              echo "EOF" >> $GITHUB_OUTPUT
+              exit 0 # 成功退出脚本
+            
+            elif [ "$status" == "failed" ] || [ "$status" == "stopped" ]; then
+              echo "::error::Task failed or was stopped. Full response:"
+              echo "$status_response"
+              exit 1 # 失败退出脚本
+            fi
+
+            # 如果任务仍在运行，则等待一段时间再查询
+            sleep $sleep_interval
+          done
+
+          # 如果循环结束任务仍未完成，则视为超时
+          echo "::error::Polling timed out after $(($max_retries * $sleep_interval)) seconds."
+          exit 1
+
+
+      # 将结果发送到 Server酱 (这一步无需修改)
       - name: Send result to ServerChan
-        if: success() # 仅当上一步成功时才执行
+        if: success()
         run: |
-          # 使用 --data-urlencode 来确保内容中的特殊字符被正确编码
           curl -sS -X POST "https://sctapi.ftqq.com/${{ secrets.SERVERCHAN_KEY }}.send" \
-            --data-urlencode "title=📅 每日Dify任务报告" \
-            --data-urlencode "desp=${{ steps.dify_call.outputs.result }}"
+            --data-urlencode "title=📅 每日Dify任务报告 (异步)" \
+            --data-urlencode "desp=${{ steps.dify_call_async.outputs.result }}"
