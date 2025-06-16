@@ -1,4 +1,27 @@
-      # 核心步骤：调用 Dify 并获取结果 (异步轮询) - 优化版
+# .github/workflows/dify_daily_run.yml
+
+name: 每日定时运行 Dify 工作流 (Daily Dify Workflow Run)
+
+on:
+  # 1. 定时触发：使用 CRON 表达式
+  # '0 20 * * *' 是北京时间 (UTC+8) 的晚上 8 点。
+  # GitHub Actions 使用 UTC 时间，北京时间 20:00 等于 UTC 时间 12:00。
+  schedule:
+    - cron: '0 12 * * *'
+
+  # 2. 手动触发：允许在 Actions 页面手动运行此工作流，方便测试
+  workflow_dispatch:
+
+jobs:
+  run-dify-workflow:
+    runs-on: ubuntu-latest # 使用最新的 Ubuntu 运行环境
+
+    steps:
+      # 步骤 1: 检出代码 (通常是好习惯)
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 步骤 2: 核心步骤 - 调用 Dify 并获取结果 (使用您提供的优化版脚本)
       - name: Call Dify Workflow Asynchronously and Poll for Result
         id: dify_call_async
         run: |
@@ -40,10 +63,11 @@
             exit 1
           fi
 
-          # --- 步骤 2: 轮询任务状态 (这部分逻辑保持不变) ---
-          status_url="https://api.dify.ai/v1/tasks/${task_id}/result" # 如果是自部署，请修改域名
+          # --- 步骤 2: 轮询任务状态 ---
+          # 如果是自部署的 Dify，请将 "https://api.dify.ai" 修改为你的服务域名
+          status_url="https://api.dify.ai/v1/tasks/${task_id}/result"
           
-          max_retries=60 # 增加轮询次数，总时长 60 * 10s = 600s = 10分钟
+          max_retries=60 # 轮询次数，总时长 60 * 10s = 600s = 10分钟
           sleep_interval=10
 
           for (( i=1; i<=max_retries; i++ )); do
@@ -56,10 +80,11 @@
 
             if [ "$status" == "succeeded" ]; then
               echo "Task succeeded!"
-              # !! 重要 !!: 同样需要根据你的输出变量名修改 '.outputs.text'
+              # !! 重要 !!: 请根据你的 Dify 工作流输出变量名修改下面的 '.outputs.text'
+              # 例如，如果你的输出变量是 'summary'，这里就应该是 '.outputs.summary'
               final_result=$(echo "$status_response" | jq -r '.outputs.text')
               
-              # 设置输出并退出循环
+              # 设置输出，供后续步骤使用
               echo "result<<EOF" >> $GITHUB_OUTPUT
               echo "$final_result" >> $GITHUB_OUTPUT
               echo "EOF" >> $GITHUB_OUTPUT
@@ -76,3 +101,4 @@
 
           echo "::error::Polling timed out after $(($max_retries * $sleep_interval)) seconds."
           exit 1
+          
