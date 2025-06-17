@@ -1,104 +1,60 @@
-# .github/workflows/dify_daily_run.yml
-
-name: 每日定时运行 Dify 工作流 (Daily Dify Workflow Run)
+name: 每日定时触发 Dify 工作流 (简化版)
 
 on:
-  # 1. 定时触发：使用 CRON 表达式
-  # '0 20 * * *' 是北京时间 (UTC+8) 的晚上 8 点。
-  # GitHub Actions 使用 UTC 时间，北京时间 20:00 等于 UTC 时间 12:00。
+  # 1. 定时触发：北京时间 (UTC+8) 的晚上 8 点 (UTC 时间 12:00)
   schedule:
     - cron: '0 12 * * *'
 
-  # 2. 手动触发：允许在 Actions 页面手动运行此工作流，方便测试
+  # 2. 手动触发：允许在 Actions 页面手动运行此工作流
   workflow_dispatch:
 
 jobs:
-  run-dify-workflow:
+  trigger-dify-workflow:
     runs-on: ubuntu-latest # 使用最新的 Ubuntu 运行环境
 
     steps:
-      # 步骤 1: 检出代码 (通常是好习惯)
+      # 步骤 1: 检出代码 (通常是好习惯，虽然在这个简化版里非必需，但保留无害)
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 步骤 2: 核心步骤 - 调用 Dify 并获取结果 (使用您提供的优化版脚本)
-      - name: Call Dify Workflow Asynchronously and Poll for Result
-        id: dify_call_async
+      # 步骤 2: 触发 Dify 工作流 (Fire and Forget)
+      - name: Trigger Dify Workflow
         run: |
-          # --- 步骤 1: 触发工作流并获取 task_id (使用流式读取，防止启动超时) ---
-          echo "Triggering Dify workflow and waiting for task_id..."
+          echo "Attempting to trigger Dify workflow..."
           
-          # 使用 curl -N (或 --no-buffer) 来处理流式响应，防止因 Dify 启动慢于 60s 而导致网关超时
-          # 使用 `timeout` 命令确保此步骤不会无限期挂起，例如最多等待 3 分钟来获取 task_id
-          task_id=""
-          timeout 180s curl -sS -N -X POST "${{ secrets.DIFY_WORKFLOW_URL }}" \
+          # 发送 POST 请求到 Dify 工作流 API
+          # -sS: 静默模式，但显示错误
+          # -f:  如果服务器返回 HTTP 错误码 (4xx 或 5xx)，则 curl 会以错误状态退出
+          # -o /dev/null: 丢弃响应体，我们只关心触发是否成功，不关心响应内容
+          # -w "%{http_code}": 输出 HTTP 状态码
+          #
+          # 重要：这里的 payload 使用了 "response_mode": "streaming"
+          # 这是为了告诉 Dify "我触发了，你开始工作吧，我不需要同步等待结果"。
+          # 即使我们不处理流式响应，这也是一个好的实践，避免 Dify 服务器长时间保持连接等待发送完整结果。
+          # 如果你的 Dify 工作流触发 API 不需要或不识别 response_mode，也可以移除它。
+          # "user" 字段可以自定义，方便在 Dify 日志中识别来源。
+          http_status=$(curl -sS -f -o /dev/null -w "%{http_code}" \
+            -X POST "${{ secrets.DIFY_WORKFLOW_URL }}" \
             -H "Authorization: Bearer ${{ secrets.DIFY_API_KEY }}" \
             -H "Content-Type: application/json" \
             -d '{
               "inputs": {},
-              "response_mode": "streaming",
-              "user": "github-actions-async-job"
-            }' | while read -r line; do
-              # 我们只关心包含 task_id 的第一条 'workflow_started' 事件
-              if [[ $line == data:* ]]; then
-                # 提取 JSON 部分
-                json_data=$(echo "$line" | sed 's/^data: //')
-                
-                # 检查是否是 workflow_started 事件
-                event=$(echo "$json_data" | jq -r '.event')
-                if [[ "$event" == "workflow_started" ]]; then
-                  task_id=$(echo "$json_data" | jq -r '.task_id')
-                  echo "Successfully received task_id: $task_id"
-                  # 成功获取 task_id 后，杀掉仍在运行的 curl 进程并退出循环
-                  # 因为我们只需要 task_id，不需要后续的流式结果
-                  pkill -P $$ curl # pkill curl that is a child of the current shell process
-                  break
-                fi
-              fi
-            done
+              "response_mode": "streaming", 
+              "user": "github-actions-simplified-trigger"
+            }')
 
-          # 检查是否成功获取 task_id
-          if [ -z "$task_id" ]; then
-            echo "::error::Failed to get task_id from Dify stream after 180 seconds."
+          echo "Dify API HTTP response code: $http_status"
+
+          # 检查 HTTP 状态码是否表示成功 (通常是 200 或 202)
+          # curl 的 -f 选项会在 >=400 时自动使脚本失败，所以这里的检查是额外的确认。
+          if [ "$http_status" -ge 200 ] && [ "$http_status" -lt 300 ]; then
+            echo "Successfully triggered Dify workflow (HTTP $http_status)."
+          else
+            # 理论上 curl -f 已经处理了错误退出，但为了明确日志，可以保留
+            echo "::error::Failed to trigger Dify workflow. HTTP response code: $http_status"
+            # 如果 curl 没有因为 -f 退出，这里强制退出
             exit 1
           fi
-
-          # --- 步骤 2: 轮询任务状态 ---
-          # 如果是自部署的 Dify，请将 "https://api.dify.ai" 修改为你的服务域名
-          status_url="https://api.dify.ai/v1/tasks/${task_id}/result"
-          
-          max_retries=60 # 轮询次数，总时长 60 * 10s = 600s = 10分钟
-          sleep_interval=10
-
-          for (( i=1; i<=max_retries; i++ )); do
-            echo "Polling attempt #$i for task $task_id..."
-            status_response=$(curl -sS -X GET "$status_url" \
-              -H "Authorization: Bearer ${{ secrets.DIFY_API_KEY }}")
-
-            status=$(echo "$status_response" | jq -r '.status')
-            echo "Current task status: $status"
-
-            if [ "$status" == "succeeded" ]; then
-              echo "Task succeeded!"
-              # !! 重要 !!: 请根据你的 Dify 工作流输出变量名修改下面的 '.outputs.text'
-              # 例如，如果你的输出变量是 'summary'，这里就应该是 '.outputs.summary'
-              final_result=$(echo "$status_response" | jq -r '.outputs.text')
-              
-              # 设置输出，供后续步骤使用
-              echo "result<<EOF" >> $GITHUB_OUTPUT
-              echo "$final_result" >> $GITHUB_OUTPUT
-              echo "EOF" >> $GITHUB_OUTPUT
-              exit 0
-            
-            elif [ "$status" == "failed" ] || [ "$status" == "stopped" ]; then
-              echo "::error::Task failed or was stopped. Full response:"
-              echo "$status_response"
-              exit 1
-            fi
-
-            sleep $sleep_interval
-          done
-
-          echo "::error::Polling timed out after $(($max_retries * $sleep_interval)) seconds."
-          exit 1
-          
+        env:
+          DIFY_WORKFLOW_URL: ${{ secrets.DIFY_WORKFLOW_URL }}
+          DIFY_API_KEY: ${{ secrets.DIFY_API_KEY }}
