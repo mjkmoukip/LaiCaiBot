@@ -1,5 +1,5 @@
-# 工作流名称，更新以反映新功能
-name: 每日定时触发 Dify 工作流 (带 Server酱通知)
+# 工作流名称：每日定时触发 Dify 工作流并推送结果到 Server酱
+name: 每日定时触发 Dify 工作流并推送结果
 
 on:
   # 1. 定时触发：北京时间 (UTC+8) 的晚上 8 点 (UTC 时间 12:00)
@@ -10,68 +10,77 @@ on:
   workflow_dispatch:
 
 jobs:
-  trigger-dify-workflow:
+  trigger-and-notify:
     runs-on: ubuntu-latest # 使用最新的 Ubuntu 运行环境
 
     steps:
-      # 步骤 1: 检出代码 (好习惯)
+      # 步骤 1: 检出代码 (可选，但保留是好习惯)
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 步骤 2: 触发 Dify 工作流
-      # 如果此步骤失败 (例如，Dify API 返回 4xx/5xx 错误)，后续的 "成功通知" 步骤将被跳过，而 "失败通知" 步骤将被执行。
-      - name: Trigger Dify Workflow
-        id: trigger # 为此步骤设置一个 id，方便后续引用 (虽然此简化版未用到，但也是好习惯)
+      # 步骤 2: 触发 Dify 工作流并获取结果
+      # 我们给这个步骤一个 id，方便后续步骤引用它的输出
+      - name: Trigger Dify Workflow & Get Result
+        id: dify_job # <--- 设置 id
         run: |
-          echo "Attempting to trigger Dify workflow..."
+          echo "Attempting to trigger Dify workflow and wait for result..."
           
           # 发送 POST 请求到 Dify 工作流 API
-          # -f:  如果服务器返回 HTTP 错误码 (4xx 或 5xx)，则 curl 会以错误状态退出，从而使此步骤失败
-          http_status=$(curl -sS -f -o /dev/null -w "%{http_code}" \
+          # -sS: 静默模式，但显示错误
+          # 不再使用 -o /dev/null，而是将响应捕获到变量 dify_response 中
+          # 移除了 "response_mode": "streaming"，改为等待阻塞式（blocking）响应
+          # 如果 curl 命令失败（例如网络错误或服务器返回 4xx/5xx），脚本将因 set -e 而退出
+          set -e
+          dify_response=$(curl -sS -f \
             -X POST "${{ secrets.DIFY_WORKFLOW_URL }}" \
             -H "Authorization: Bearer ${{ secrets.DIFY_API_KEY }}" \
             -H "Content-Type: application/json" \
             -d '{
               "inputs": {},
-              "response_mode": "streaming", 
+              "response_mode": "blocking", 
               "user": "github-actions-serverchan-trigger"
             }')
 
-          echo "Dify API HTTP response code: $http_status"
+          echo "Received response from Dify API."
+          # echo "Dify Raw Response: $dify_response" # 可取消注释用于调试
 
-          # 检查 HTTP 状态码是否表示成功 (通常是 200 或 202)
-          # curl 的 -f 选项会处理失败情况，这里的检查是为了更清晰的日志输出。
-          if [ "$http_status" -ge 200 ] && [ "$http_status" -lt 300 ]; then
-            echo "Successfully triggered Dify workflow (HTTP $http_status)."
-          else
-            # 这一部分可能不会执行，因为 curl -f 会让脚本提前失败，但作为双重保障保留
-            echo "::error::Failed to trigger Dify workflow. HTTP response code: $http_status"
+          # 使用 jq 解析 JSON 响应，提取 answer 字段
+          # -r 选项移除结果字符串两边的引号
+          # 如果 .answer 不存在或为 null，jq 会返回 null 字符串
+          dify_result=$(echo "$dify_response" | jq -r '.answer')
+
+          if [ -z "$dify_result" ] || [ "$dify_result" == "null" ]; then
+            echo "::error::Could not find 'answer' in Dify response or it was empty."
+            echo "Full Dify Response: $dify_response"
             exit 1
           fi
+
+          echo "Successfully extracted result from Dify."
+          
+          # 将多行结果正确地设置为 GitHub Actions 的输出
+          # 这是处理多行字符串作为输出的最佳实践
+          echo "result<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$dify_result" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
         env:
           DIFY_WORKFLOW_URL: ${{ secrets.DIFY_WORKFLOW_URL }}
           DIFY_API_KEY: ${{ secrets.DIFY_API_KEY }}
 
-      # 步骤 3: 发送成功通知 (Server酱)
-      # if: success() 确保只有在前面的所有步骤都成功时才运行此步骤
-      - name: Send Success Notification via ServerChan
-        if: success()
+      # 步骤 3: 将 Dify 结果发送到 Server酱
+      # 仅当上一步 (dify_job) 成功，并且其输出 result 不为空时运行
+      - name: Send Result to ServerChan
+        if: success() && steps.dify_job.outputs.result != ''
         run: |
+          echo "Sending Dify result to ServerChan..."
+          
+          # Server酱支持 Markdown，Dify 的结果可以直接使用
+          # 使用 --data-urlencode 来正确编码内容，避免特殊字符（如 &、=、换行符）导致的问题
           curl -sS --fail -X POST \
-            -d "title=✅ Dify 工作流触发成功" \
-            -d "desp=工作流 **'${{ github.workflow }}'** 已成功触发。%0A%0A- 触发方式: `${{ github.event_name }}`%0A- [点此查看运行日志](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})" \
+            --data-urlencode "title=Dify 每日任务报告" \
+            --data-urlencode "desp=${{ steps.dify_job.outputs.result }}" \
             "https://sctapi.ftqq.com/${{ secrets.SERVERCHAN_KEY }}.send"
-        env:
-          SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
-
-      # 步骤 4: 发送失败通知 (Server酱)
-      # if: failure() 确保只有在前面的任何步骤失败时才运行此步骤
-      - name: Send Failure Notification via ServerChan
-        if: failure()
-        run: |
-          curl -sS --fail -X POST \
-            -d "title=🚨 Dify 工作流触发失败" \
-            -d "desp=工作流 **'${{ github.workflow }}'** 触发失败，请立即检查。%0A%0A- 触发方式: `${{ github.event_name }}`%0A- [点此查看运行日志](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})" \
-            "https://sctapi.ftqq.com/${{ secrets.SERVERCHAN_KEY }}.send"
+            
+          echo "Notification sent to ServerChan successfully."
         env:
           SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
